@@ -1,0 +1,1408 @@
+--!nocheck
+-- ==============================================================================
+-- PET SIMULATOR 99 - AUTO SELL PLAZA (CONFIG / HEADLESS VERSION)
+-- Script tự động bán hàng tại Trading Plaza điều khiển bằng bảng Config trực tiếp
+-- Không sử dụng giao diện (No UI) - Tất cả thông tin được in trực tiếp ra Console
+-- ==============================================================================
+
+if not game:IsLoaded() then
+    game.Loaded:Wait()
+end
+
+local HttpService = game:GetService("HttpService")
+local Players = game:GetService("Players")
+local TeleportService = game:GetService("TeleportService")
+local Stats = game:GetService("Stats")
+local VirtualUser = game:GetService("VirtualUser")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+-- Đảm bảo LocalPlayer đã được khởi tạo và Game đã load xong data
+local LocalPlayer = Players.LocalPlayer
+while not LocalPlayer do
+    task.wait(0.1)
+    LocalPlayer = Players.LocalPlayer
+end
+
+-- Đợi server PS99 báo hiệu data đã load xong hoàn toàn (__LOADED)
+repeat task.wait(0.5) until LocalPlayer:GetAttribute("__LOADED")
+
+-- Đợi Character và HumanoidRootPart xuất hiện (Server PS99 sẽ từ chối claim booth nếu chưa có Character)
+if not LocalPlayer.Character then 
+    LocalPlayer.CharacterAdded:Wait() 
+end
+local character = LocalPlayer.Character
+if not character:FindFirstChild("HumanoidRootPart") then
+    character:WaitForChild("HumanoidRootPart", 10)
+end
+task.wait(1) -- Nghỉ 1 giây để server PS99 load xong data và hết join cooldown trước khi claim quầy
+
+local Library = ReplicatedStorage:WaitForChild("Library")
+local Network = require(Library:WaitForChild("Client"):WaitForChild("Network"))
+local Signal = require(Library:WaitForChild("Signal"))
+
+-- ==============================================================================
+-- 1. BẢNG CẤU HÌNH (CONFIGURATION)
+-- Chỉnh sửa các thiết lập bên dưới tùy theo nhu cầu sử dụng
+-- ==============================================================================
+local Config = getgenv().PlazaSellConfig or {
+    -- Bật / Tắt script bán hàng
+    Enabled = true,
+
+    -- Chế độ chọn Plaza: "Auto Select" | "Normal Plaza" | "Pro Plaza"
+    PlazaType = "Auto Select",
+
+    -- Tự động dịch chuyển đến Plaza nếu đang ở World thường
+    AutoTeleport = true,
+
+    -- --------------------------------------------------------------------------
+    -- DANH SÁCH VẬT PHẨM BÁN (ITEMS CONFIG) - CẤU HÌNH GỌN TRÊN 1 DÒNG
+    -- Cú pháp:
+    --   ["Tên Item"] = { Price = "Giá_Cố_Định", Amount = "Tổng SL", Limit = "Lần Treo", Slots = "Số Slot" }
+    --   HOẶC
+    --   ["Tên Item"] = { Cosmic = %_Chênh_Lệch, Amount = "Tổng SL", Limit = "Lần Treo", Slots = "Số Slot" }
+    --   HOẶC
+    --   ["Tên Item"] = { RAP = %_Chênh_Lệch, Amount = "Tổng SL", Limit = "Lần Treo", Slots = "Số Slot" }
+    --
+    -- Cách chỉnh Over / Under Cosmic & RAP:
+    --   - Cosmic = -5 : Bán Under Cosmic 5% (rẻ hơn 5% so với giá Cosmic Values)
+    --   - Cosmic = 0  : Bán đúng 100% giá Cosmic Values
+    --   - Cosmic = 10 : Bán Over Cosmic 10% (đắt hơn 10% so với giá Cosmic Values)
+    --   - RAP = 0     : Bán đúng 100% giá thị trường RAP
+    --   * Lưu ý: Nếu chọn mode Cosmic mà item không có giá Cosmic (hoặc không phải Pet), hệ thống sẽ BỎ QUA (Skip) không treo bán.
+    -- --------------------------------------------------------------------------
+    Items = {
+        ["Huge Butterfly Pony"] = { Cosmic = 0, Slots = 2 },                   -- Bán Huge Butterfly Pony theo 100% Cosmic Values (22m Gems)
+        --["Huge Happy Computer"]  = { Cosmic = 0, Slots = 2 },                       -- Bán Huge Happy Computer đúng 100% giá Cosmic Values
+        --["Apple"]                = { RAP = 0, Slots = 2 },                         -- Bán Apple đúng 100% giá RAP (0%), tối đa 2 slot
+        --["Banana"]               = { Price = "500", Amount = 50, Slots = 1 },      -- Bán Banana giá cố định 500 Gems, tổng 50 cái, 1 slot
+        --["Rainbow Fruit"]        = { RAP = 10, Slots = 1 },                        -- Bán Rainbow Fruit Over RAP 10% (đắt hơn 10%), 1 slot
+    },
+
+    -- --------------------------------------------------------------------------
+    -- QUY TẮC BÁN THEO DANH MỤC (CATEGORY RULES)
+    -- Áp dụng cho các item KHÔNG nằm trong bảng Items ở trên
+    -- (Những danh mục không ghi ở đây sẽ tự động TẮT / Disabled)
+    --
+    -- Cú pháp:
+    --   ["Tên Danh Mục"] = { Cosmic = %_chênh_lệch, Slots = Số_Slot_Tối_Đa } --> Bán theo Cosmic Values %
+    --   ["Tên Danh Mục"] = { RAP = %_chênh_lệch, Slots = Số_Slot_Tối_Đa }    --> Bán theo RAP %
+    --   ["Tên Danh Mục"] = { Fixed = "Giá_Bán", Slots = Số_Slot_Tối_Đa }     --> Bán giá cố định
+    --
+    -- Các danh mục hỗ trợ:
+    --   "Pet", "Huge", "Titanic", "Gargantuan", "Enchant", "Potion",
+    --   "Egg", "Hoverboard", "Charm", "Lootbox", "Ultimate", "Misc", "Booth"
+    -- --------------------------------------------------------------------------
+    CategoryRules = {
+        --["Huge"]    = { Cosmic = 0, Slots = 2 },          -- Bán Huge theo giá Cosmic Values (0% chênh lệch), tối đa 2 slot
+        --["Huge"]    = { RAP = 100, Slots = 2 },          -- Bán Huge theo RAP +100%, tối đa 2 slot trên quầy
+        --["Egg"]     = { RAP = 0 },                      -- Bán đúng 100% giá RAP
+        --["Potion"]  = { Fixed = "500", Slots = 1 },     -- Giá cố định 500 Gems, tối đa 1 slot
+    },
+
+    -- --------------------------------------------------------------------------
+    -- SERVER HOP & TỐI ƯU HÓA HỆ THỐNG
+    -- --------------------------------------------------------------------------
+    AutoHop = false,             -- Tự động đổi server khi thỏa điều kiện bên dưới
+    MinPlayers = 5,              -- Nhảy server nếu số người trong server <= số này
+    AutoRejoinRAM = 4000,        -- Giới hạn RAM (MB) trước khi tự hop (tránh văng game)
+    AutoRejoinTime = 10800,      -- Thời gian tự nhảy server tính theo giây (10800s = 3 tiếng)
+
+    -- --------------------------------------------------------------------------
+    -- DISCORD WEBHOOK (SALES NOTIFICATION)
+    -- --------------------------------------------------------------------------
+    WebhookURL = "https://discord.com/api/webhooks/1397922298501005433/GEYiKwB5LYJ2zP5k9EZDMrNeE2Hl6tJKSjZsi4q1-prT7PW-49ylG61Orx_dR73DgDaf",             -- Dán Webhook URL Discord của bạn vào đây (English Webhook)
+
+    -- --------------------------------------------------------------------------
+    -- CHỐNG TREO MÁY (ANTI-AFK)
+    -- --------------------------------------------------------------------------
+    AntiAFK = true,              -- Bật hệ thống 3 lớp chống bị văng sau 20 phút
+}
+
+-- ==============================================================================
+-- 2. HÀM BỔ TRỢ XỬ LÝ SỐ & DỮ LIỆU
+-- ==============================================================================
+local function getHttpRequestFunc()
+    local env = (typeof(getgenv) == "function" and getgenv()) or getfenv()
+    local synTable = rawget(env, "syn") or rawget(_G, "syn")
+    if typeof(synTable) == "table" and typeof(synTable.request) == "function" then
+        return synTable.request
+    end
+    local httpTable = rawget(env, "http") or rawget(_G, "http")
+    if typeof(httpTable) == "table" and typeof(httpTable.request) == "function" then
+        return httpTable.request
+    end
+    local httpReq = rawget(env, "http_request") or rawget(_G, "http_request")
+    if typeof(httpReq) == "function" then
+        return httpReq
+    end
+    local req = rawget(env, "request") or rawget(_G, "request")
+    if typeof(req) == "function" then
+        return req
+    end
+    return nil
+end
+
+local function parseNumber(str)
+    if not str then return nil end
+    if type(str) == "number" then return math.floor(str) end
+    str = tostring(str):lower():gsub("%s+", ""):gsub(",", "")
+    local multiplier = 1
+    if str:find("k$") then
+        multiplier = 1e3
+        str = str:sub(1, -2)
+    elseif str:find("m$") then
+        multiplier = 1e6
+        str = str:sub(1, -2)
+    elseif str:find("b$") then
+        multiplier = 1e9
+        str = str:sub(1, -2)
+    elseif str:find("t$") then
+        multiplier = 1e12
+        str = str:sub(1, -2)
+    end
+    local num = tonumber(str)
+    return num and math.floor(num * multiplier) or nil
+end
+
+local function formatNumber(num)
+    if not num then return "0" end
+    if num >= 1e12 then
+        return string.format("%.2ft", num / 1e12):gsub("%.00t", "t"):gsub("%.([0-9])0t", ".%1t")
+    elseif num >= 1e9 then
+        return string.format("%.2fb", num / 1e9):gsub("%.00b", "b"):gsub("%.([0-9])0b", ".%1b")
+    elseif num >= 1e6 then
+        return string.format("%.2fm", num / 1e6):gsub("%.00m", "m"):gsub("%.([0-9])0m", ".%1m")
+    elseif num >= 1e3 then
+        return string.format("%.2fk", num / 1e3):gsub("%.00k", "k"):gsub("%.([0-9])0k", ".%1k")
+    end
+    return tostring(num)
+end
+
+local function normalizeOption(val)
+    if val == nil then return "All" end
+    if type(val) == "string" and val:lower() == "all" then return "All" end
+    local num = parseNumber(val)
+    return num or val
+end
+
+-- Chuẩn hóa bảng Items
+local normalizedItems = {}
+for itemName, itemCfg in pairs(Config.Items or {}) do
+    if type(itemCfg) == "table" then
+        local cosmicVal = nil
+        local rapVal = nil
+        if itemCfg.Cosmic ~= nil then
+            cosmicVal = tonumber((tostring(itemCfg.Cosmic):gsub("%%", ""))) or 0
+        elseif itemCfg.RAP ~= nil then
+            rapVal = tonumber((tostring(itemCfg.RAP):gsub("%%", ""))) or 0
+        elseif type(itemCfg.Price) == "string" and itemCfg.Price:find("%%") then
+            rapVal = tonumber((itemCfg.Price:gsub("%%", ""))) or 0
+        end
+        
+        normalizedItems[itemName] = {
+            Price = (rapVal == nil and cosmicVal == nil) and (parseNumber(itemCfg.Price) or 0) or 0,
+            RAP = rapVal,
+            Cosmic = cosmicVal,
+            Amount = normalizeOption(itemCfg.Amount),
+            Limit = normalizeOption(itemCfg.Limit),
+            Slots = normalizeOption(itemCfg.Slots),
+        }
+    elseif type(itemCfg) == "number" or type(itemCfg) == "string" then
+        local str = tostring(itemCfg)
+        if str:lower():find("cosmic") then
+            local cosmicVal = tonumber((str:gsub("[^%d%-+.]", ""))) or 0
+            normalizedItems[itemName] = { Price = 0, RAP = nil, Cosmic = cosmicVal, Amount = "All", Limit = "All", Slots = "All" }
+        elseif str:find("%%") then
+            local rapVal = tonumber((str:gsub("%%", ""))) or 0
+            normalizedItems[itemName] = { Price = 0, RAP = rapVal, Cosmic = nil, Amount = "All", Limit = "All", Slots = "All" }
+        else
+            normalizedItems[itemName] = { Price = parseNumber(str) or 0, RAP = nil, Cosmic = nil, Amount = "All", Limit = "All", Slots = "All" }
+        end
+    end
+end
+Config.Items = normalizedItems
+
+-- Chuẩn hóa bảng CategoryRules
+local normalizedCategoryRules = {}
+for catName, rule in pairs(Config.CategoryRules or {}) do
+    if type(rule) == "table" then
+        local mode = "Disabled"
+        local price = 0
+        local percent = 0
+        local slots = normalizeOption(rule.Slots)
+        
+        if rule.Cosmic ~= nil then
+            mode = "Cosmic"
+            percent = tonumber((tostring(rule.Cosmic):gsub("%%", ""))) or 0
+        elseif rule.RAP ~= nil then
+            mode = "RAP"
+            percent = tonumber((tostring(rule.RAP):gsub("%%", ""))) or 0
+        elseif rule.Fixed ~= nil then
+            mode = "Fixed"
+            price = parseNumber(rule.Fixed) or 0
+        elseif rule.Mode then
+            mode = rule.Mode
+            price = parseNumber(rule.Price) or 0
+            percent = tonumber(rule.Percent) or 0
+        end
+        
+        normalizedCategoryRules[catName] = {
+            Mode = mode,
+            Price = price,
+            Percent = percent,
+            Slots = slots,
+        }
+    elseif type(rule) == "number" or type(rule) == "string" then
+        local str = tostring(rule)
+        if str:lower():find("cosmic") then
+            local pct = tonumber((str:gsub("[^%d%-+.]", ""))) or 0
+            normalizedCategoryRules[catName] = { Mode = "Cosmic", Percent = pct, Price = 0, Slots = "All" }
+        elseif str:find("%%") or (tonumber(str) and tonumber(str) <= 100 and tonumber(str) >= -100) then
+            local pct = tonumber((str:gsub("%%", ""))) or 0
+            normalizedCategoryRules[catName] = { Mode = "RAP", Percent = pct, Price = 0, Slots = "All" }
+        else
+            local p = parseNumber(str) or 0
+            normalizedCategoryRules[catName] = { Mode = "Fixed", Price = p, Percent = 0, Slots = "All" }
+        end
+    end
+end
+Config.CategoryRules = normalizedCategoryRules
+
+-- Hàm tra cứu cấu hình của 1 item
+local function getItemConfig(name, itemObj)
+    local itemsTable = (getgenv().PlazaSellConfig and getgenv().PlazaSellConfig.Items) or Config.Items
+    if not itemsTable then return nil end
+    if itemsTable[name] then return itemsTable[name] end
+    
+    local noShiny = name:gsub("^Shiny%s+", "")
+    if itemsTable[noShiny] then return itemsTable[noShiny] end
+    
+    if itemObj then
+        local baseName = nil
+        pcall(function() baseName = itemObj:Directory().name end)
+        if baseName then
+            if itemsTable[baseName] then return itemsTable[baseName] end
+            local isGold = false
+            local isRb = false
+            pcall(function() isGold = itemObj:IsGolden() end)
+            pcall(function() isRb = itemObj:IsRainbow() end)
+            if isGold and itemsTable["Golden " .. baseName] then
+                return itemsTable["Golden " .. baseName]
+            elseif isRb and itemsTable["Rainbow " .. baseName] then
+                return itemsTable["Rainbow " .. baseName]
+            end
+        end
+    end
+    return nil
+end
+
+-- Đồng bộ cấu hình vào getgenv
+getgenv().PlazaSellConfig = Config
+
+-- Hàm lấy link ảnh trực tiếp từ Roblox CDN
+local function getAssetThumbnailUrl(assetId)
+    if not assetId then return "" end
+    assetId = tostring(assetId):match("%d+")
+    if not assetId then return "" end
+    return "https://biggamesapi.io/image/" .. assetId
+end
+
+-- ==============================================================================
+-- 3. HỆ THỐNG THỐNG KÊ DOANH THU & KIM CƯƠNG
+-- ==============================================================================
+getgenv().PlazaSellStats = getgenv().PlazaSellStats or {
+    SalesLog = {} -- Danh sách giao dịch: { timestamp, name, price, amount }
+}
+
+local function recordSale(itemName, price, amount)
+    local stats = getgenv().PlazaSellStats
+    table.insert(stats.SalesLog, {
+        timestamp = os.time(),
+        name = itemName,
+        price = price,
+        amount = amount or 1
+    })
+    
+    local now = os.time()
+    local activeLog = {}
+    for _, sale in ipairs(stats.SalesLog) do
+        if now - sale.timestamp <= 86400 then
+            table.insert(activeLog, sale)
+        end
+    end
+    stats.SalesLog = activeLog
+end
+
+local function getSalesCount1H()
+    local now = os.time()
+    local count = 0
+    for _, sale in ipairs(getgenv().PlazaSellStats.SalesLog) do
+        if now - sale.timestamp <= 3600 then
+            count = count + (sale.amount or 1)
+        end
+    end
+    return count
+end
+
+local function getSalesCount24H()
+    local now = os.time()
+    local count = 0
+    for _, sale in ipairs(getgenv().PlazaSellStats.SalesLog) do
+        if now - sale.timestamp <= 86400 then
+            count = count + (sale.amount or 1)
+        end
+    end
+    return count
+end
+
+local function getGems1H()
+    local now = os.time()
+    local total = 0
+    for _, sale in ipairs(getgenv().PlazaSellStats.SalesLog) do
+        if now - sale.timestamp <= 3600 then
+            total = total + sale.price
+        end
+    end
+    return total
+end
+
+local function getGems24H()
+    local now = os.time()
+    local total = 0
+    for _, sale in ipairs(getgenv().PlazaSellStats.SalesLog) do
+        if now - sale.timestamp <= 86400 then
+            total = total + sale.price
+        end
+    end
+    return total
+end
+
+local function getPlayerDiamonds()
+    local success, count = pcall(function()
+        local Lib = ReplicatedStorage:FindFirstChild("Library")
+        if Lib then
+            local Client = Lib:WaitForChild("Client")
+            local okCmds, CurrencyCmds = pcall(require, Client:WaitForChild("CurrencyCmds"))
+            if okCmds and CurrencyCmds and CurrencyCmds.Get then
+                local amt = CurrencyCmds.Get("Diamonds")
+                if type(amt) == "number" then return amt end
+            end
+
+            local Save = require(Client:WaitForChild("Save"))
+            local data = Save.Get()
+            if data then
+                if data.Currency and type(data.Currency.Diamonds) == "number" then
+                    return data.Currency.Diamonds
+                elseif data.Diamonds then
+                    return data.Diamonds
+                end
+            end
+        end
+        return 0
+    end)
+    if success and count then return count end
+    
+    local leaderstats = LocalPlayer:FindFirstChild("leaderstats")
+    local diamonds = leaderstats and (leaderstats:FindFirstChild("Diamonds") or leaderstats:FindFirstChild("💎 Diamonds") or leaderstats:FindFirstChild("Gems"))
+    if diamonds then
+        local val = tostring(diamonds.Value):gsub(",", ""):match("%d+")
+        return tonumber(val) or 0
+    end
+    return 0
+end
+
+-- ==============================================================================
+-- 4. HỆ THỐNG DISCORD WEBHOOK (BATCH NOTIFICATION)
+-- ==============================================================================
+local pendingWebhookSales = {}
+local isWebhookBatchScheduled = false
+
+local function processBatchWebhook()
+    local salesToProcess = pendingWebhookSales
+    pendingWebhookSales = {}
+    isWebhookBatchScheduled = false
+    
+    if #salesToProcess == 0 then return end
+    
+    local cfg = getgenv().PlazaSellConfig
+    if not cfg then return end
+    local webhookURL = cfg.WebhookURL
+    if not webhookURL or webhookURL == "" or not webhookURL:find("https://discord.com/api/webhooks") then return end
+    
+    pcall(function()
+        local itemSummary = {}
+        local grandTotalPrice = 0
+        local lastIconUrl = nil
+        
+        for _, sale in ipairs(salesToProcess) do
+            grandTotalPrice = grandTotalPrice + (sale.price or 0)
+            if sale.iconUrl and sale.iconUrl ~= "" then
+                lastIconUrl = sale.iconUrl
+            end
+            
+            if not itemSummary[sale.itemName] then
+                itemSummary[sale.itemName] = {
+                    amount = sale.amount or 1,
+                    price = sale.price or 0
+                }
+            else
+                itemSummary[sale.itemName].amount = itemSummary[sale.itemName].amount + (sale.amount or 1)
+                itemSummary[sale.itemName].price = itemSummary[sale.itemName].price + (sale.price or 0)
+            end
+        end
+        
+        local itemListLines = {}
+        for name, info in pairs(itemSummary) do
+            table.insert(itemListLines, string.format("%s x%d", name, info.amount))
+        end
+        local nameValueText = table.concat(itemListLines, "\n")
+        
+        local curDiamonds = getPlayerDiamonds()
+        local sold1H = getSalesCount1H()
+        local sold24H = getSalesCount24H()
+        local gems1H = getGems1H()
+        local gems24H = getGems24H()
+        
+        local payload = HttpService:JSONEncode({
+            embeds = {
+                {
+                    title = "Item sold successfully!",
+                    color = 5814783,
+                    fields = {
+                        { name = "Item Name", value = nameValueText, inline = true },
+                        { name = "Sell Price", value = formatNumber(grandTotalPrice) .. " Gems", inline = true },
+                        { name = "Player", value = LocalPlayer.Name .. " (" .. LocalPlayer.DisplayName .. ")", inline = false },
+                        { name = "Gems Owned", value = formatNumber(curDiamonds) .. " 💎", inline = true },
+                        { name = "Amount Sold", value = tostring(sold1H) .. " items / hour\n" .. tostring(sold24H) .. " items / day", inline = true },
+                        { name = "Gems Earned", value = "+" .. formatNumber(gems1H) .. " / hour\n+" .. formatNumber(gems24H) .. " / day", inline = true }
+                    },
+                    thumbnail = {
+                        url = lastIconUrl or getAssetThumbnailUrl(14293722239)
+                    },
+                    footer = {
+                        text = "Auto Sell | Time: " .. os.date("%H:%M:%S")
+                    }
+                }
+            }
+        })
+        
+        local req = getHttpRequestFunc()
+        if req then
+            req({
+                Url = webhookURL,
+                Method = "POST",
+                Headers = { ["Content-Type"] = "application/json" },
+                Body = payload
+            })
+            print("[WEBHOOK] Batched Webhook notification sent successfully!")
+        else
+            print("[WEBHOOK] Executor does not support HTTP requests!")
+        end
+    end)
+end
+
+local function queueSaleForWebhook(itemName, amount, price, iconUrl)
+    table.insert(pendingWebhookSales, {
+        itemName = itemName,
+        amount = amount,
+        price = price,
+        iconUrl = iconUrl
+    })
+    
+    if not isWebhookBatchScheduled then
+        isWebhookBatchScheduled = true
+        task.spawn(function()
+            task.wait(3)
+            processBatchWebhook()
+        end)
+    end
+end
+
+-- Lắng nghe sự kiện bán hàng từ PS99
+Network.Fired("Booths: Add History"):Connect(function(saleLog)
+    local success, err = pcall(function()
+        if not saleLog or not getgenv().PlazaSellConfig then return end
+        
+        local Types = require(Library:WaitForChild("Items"):WaitForChild("Types"))
+        local received = Types.DecodeUnpacked(saleLog.Received)
+        local given = Types.DecodeUnpacked(saleLog.Given)
+        
+        local price = 0
+        local soldItem = nil
+        local isSale = true
+        
+        for _, item in ipairs(received) do
+            if item:IsA("Currency") then
+                price = math.max(price, item:GetAmount() or 0)
+            else
+                soldItem = item
+                isSale = false
+            end
+        end
+        
+        for _, item in ipairs(given) do
+            if item:IsA("Currency") then
+                price = math.max(price, item:GetAmount() or 0)
+            else
+                soldItem = item
+            end
+        end
+        
+        if not soldItem or not isSale then return end
+        
+        local itemName = soldItem:GetName()
+        local amount = soldItem:GetAmount() or 1
+        
+        print(string.format("[SALE NOTIFY] Sold: %s x%d for %s Gems", itemName, amount, formatNumber(price)))
+        
+        local itemCfg = getItemConfig(itemName, soldItem)
+        if itemCfg then
+            if itemCfg.Amount and itemCfg.Amount ~= "All" then
+                local num = tonumber(itemCfg.Amount)
+                if num then
+                    local newQty = math.max(0, num - amount)
+                    itemCfg.Amount = (newQty <= 0) and 0 or newQty
+                end
+            end
+            if itemCfg.Limit and itemCfg.Limit ~= "All" then
+                local num = tonumber(itemCfg.Limit)
+                if num then
+                    local newLimit = math.max(0, num - 1)
+                    itemCfg.Limit = (newLimit <= 0) and 0 or newLimit
+                end
+            end
+        end
+        
+        recordSale(itemName, price, amount)
+        
+        getgenv().PlazaSellListedCache = nil
+        if getgenv().PlazaSellSlotCache and getgenv().PlazaSellSlotCache > 0 then
+            getgenv().PlazaSellSlotCache = math.max(0, getgenv().PlazaSellSlotCache - 1)
+        end
+        
+        local iconUrl = nil
+        local iconAsset = soldItem:GetIcon()
+        if iconAsset then
+            iconUrl = getAssetThumbnailUrl(iconAsset)
+        end
+        if not iconUrl or iconUrl == "" then
+            iconUrl = getAssetThumbnailUrl(14293722239)
+        end
+        
+        queueSaleForWebhook(itemName, amount, price, iconUrl)
+    end)
+    if not success then
+        warn("[WEBHOOK ERROR] Error processing Booths: Add History:", err)
+    end
+end)
+
+-- ==============================================================================
+-- 5. HỆ THỐNG ANTI-AFK (3 LAYERS)
+-- ==============================================================================
+local function initAntiAFK()
+    if getgenv().AntiAFKConnection then
+        pcall(function() getgenv().AntiAFKConnection:Disconnect() end)
+        getgenv().AntiAFKConnection = nil
+    end
+
+    if not getgenv().PlazaSellConfig.AntiAFK then return end
+
+    -- Layer 1: Roblox Idled Event
+    getgenv().AntiAFKConnection = Players.LocalPlayer.Idled:Connect(function()
+        local ok, vu = pcall(function() return game:GetService("VirtualUser") end)
+        if ok and vu then
+            vu:Button2Down(Vector2.new(0, 0), workspace.CurrentCamera.CFrame)
+            task.wait(1)
+            vu:Button2Up(Vector2.new(0, 0), workspace.CurrentCamera.CFrame)
+        end
+    end)
+
+    -- Layer 2: Disable PS99 Idle Tracking script & gửi Stop Timer
+    pcall(function()
+        local PlayerScripts = LocalPlayer.PlayerScripts:WaitForChild("Scripts", 5)
+        if PlayerScripts then
+            local Core = PlayerScripts:FindFirstChild("Core")
+            if Core then
+                if Core:FindFirstChild("Server Closing") then Core["Server Closing"].Enabled = false end
+                if Core:FindFirstChild("Idle Tracking") then Core["Idle Tracking"].Enabled = false end
+            end
+        end
+        Network.Fire("Idle Tracking: Stop Timer")
+    end)
+
+    -- Layer 3: Periodic VirtualUser move mỗi 4 phút
+    if not getgenv()._PlazaAntiAFKLoop then
+        getgenv()._PlazaAntiAFKLoop = true
+        task.spawn(function()
+            while getgenv()._PlazaAntiAFKLoop and getgenv().PlazaSellConfig.AntiAFK do
+                task.wait(240)
+                if not getgenv().PlazaSellConfig.AntiAFK then break end
+                pcall(function()
+                    local vu = game:GetService("VirtualUser")
+                    vu:Button2Down(Vector2.new(0, 0), workspace.CurrentCamera.CFrame)
+                    task.wait(0.1)
+                    vu:Button2Up(Vector2.new(0, 0), workspace.CurrentCamera.CFrame)
+                    Network.Fire("Idle Tracking: Stop Timer")
+                end)
+            end
+            getgenv()._PlazaAntiAFKLoop = nil
+        end)
+    end
+end
+
+task.defer(initAntiAFK)
+
+-- ==============================================================================
+-- 6. TỰ DỊCH CHUYỂN PLAZA & AUTO SERVER HOP
+-- ==============================================================================
+local function checkAndTeleport()
+    local cfg = getgenv().PlazaSellConfig
+    if not cfg or not cfg.Enabled or not cfg.AutoTeleport then return end
+    
+    local LibraryInstance = ReplicatedStorage:FindFirstChild("Library")
+    if not LibraryInstance then return end
+    
+    local TradingPlazaCmds, PlaceFile
+    local client = LibraryInstance:FindFirstChild("Client")
+    local cmdModule = client and client:FindFirstChild("TradingPlazaCmds")
+    if cmdModule then
+        pcall(function() TradingPlazaCmds = require(cmdModule) end)
+    end
+    
+    local modules = LibraryInstance:FindFirstChild("Modules")
+    local fileModule = modules and modules:FindFirstChild("PlaceFile")
+    if fileModule then
+        pcall(function() PlaceFile = require(fileModule) end)
+    end
+    
+    local isOnPlaza = false
+    if TradingPlazaCmds and TradingPlazaCmds.IsOnTradingPlaza then
+        isOnPlaza = TradingPlazaCmds.IsOnTradingPlaza()
+    else
+        isOnPlaza = game.PlaceId == 15502339080 or game.PlaceId == 15588442388 or workspace:FindFirstChild("TradingPlaza") ~= nil
+    end
+    
+    if not isOnPlaza then
+        print("[TELEPORT] Main world detected. Teleporting to Trading Plaza...")
+        local targetPlaceId
+        local selection = cfg.PlazaType
+        
+        local normalId = 15502339080
+        local proId = 15588442388
+        
+        if PlaceFile and PlaceFile.LocalPlaces then
+            normalId = PlaceFile.LocalPlaces.Trading or normalId
+            proId = PlaceFile.LocalPlaces.ProTrading or proId
+        end
+        
+        if selection == "Normal Plaza" then
+            targetPlaceId = normalId
+        elseif selection == "Pro Plaza" then
+            targetPlaceId = proId
+        else
+            if TradingPlazaCmds and TradingPlazaCmds.GetAvailable then
+                local av = TradingPlazaCmds.GetAvailable()
+                if av and #av > 0 then
+                    targetPlaceId = av[1].PlaceId
+                end
+            end
+            if not targetPlaceId then targetPlaceId = normalId end
+        end
+        
+        if targetPlaceId then
+            task.wait(1)
+            if TradingPlazaCmds and TradingPlazaCmds.RequestTradingPlaza then
+                TradingPlazaCmds.RequestTradingPlaza(targetPlaceId)
+            else
+                pcall(function()
+                    TeleportService:Teleport(targetPlaceId, LocalPlayer)
+                end)
+            end
+        end
+    end
+end
+
+local function serverHop()
+    local cfg = getgenv().PlazaSellConfig
+    if not cfg or not cfg.AutoHop then return end
+    print("[SYSTEM] Attempting to Auto Server Hop...")
+    
+    local targetPlaceId = game.PlaceId
+    if cfg.PlazaType == "Normal Plaza" then targetPlaceId = 15502339080
+    elseif cfg.PlazaType == "Pro Plaza" then targetPlaceId = 15588442388 end
+    
+    local servers = {}
+    local req = getHttpRequestFunc()
+    if req then
+        local success, res = pcall(function()
+            return req({
+                Url = string.format("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Desc&limit=100", targetPlaceId),
+                Method = "GET"
+            })
+        end)
+        if success and res.Body then
+            local decoded = HttpService:JSONDecode(res.Body)
+            if decoded and decoded.data then
+                for _, srv in ipairs(decoded.data) do
+                    if srv.playing and srv.maxPlayers and srv.playing < srv.maxPlayers - 2 and srv.id ~= game.JobId then
+                        table.insert(servers, srv)
+                    end
+                end
+            end
+        end
+    end
+    
+    if #servers > 0 then
+        local target = servers[math.random(1, #servers)]
+        print("[SYSTEM] Hopping to server:", target.id)
+        TeleportService:TeleportToPlaceInstance(targetPlaceId, target.id, LocalPlayer)
+    else
+        print("[SYSTEM] No suitable servers found. Rejoining random server...")
+        TeleportService:Teleport(targetPlaceId, LocalPlayer)
+    end
+end
+
+local function checkRAM()
+    local cfg = getgenv().PlazaSellConfig
+    if not cfg or not cfg.AutoHop then return end
+    
+    local ramMB = math.floor(Stats:GetTotalMemoryUsageMb())
+    local threshold = tonumber(cfg.AutoRejoinRAM) or 4000
+    if ramMB >= threshold then
+        print(string.format("[SYSTEM] RAM Warning: %d MB exceeded threshold %d MB. Hopping server...", ramMB, threshold))
+        serverHop()
+        task.wait(10)
+    end
+end
+
+getgenv().PlazaSellScriptStartTime = getgenv().PlazaSellScriptStartTime or os.time()
+
+local function checkRejoinTimer()
+    local cfg = getgenv().PlazaSellConfig
+    if not cfg or not cfg.AutoHop then return end
+    
+    local maxTime = tonumber(cfg.AutoRejoinTime) or 0
+    if maxTime > 0 then
+        local elapsed = os.time() - getgenv().PlazaSellScriptStartTime
+        if elapsed >= maxTime then
+            print(string.format("[SYSTEM] Time Warning: %d seconds elapsed, reached threshold %d seconds. Hopping server...", elapsed, maxTime))
+            getgenv().PlazaSellScriptStartTime = os.time()
+            serverHop()
+            task.wait(10)
+        end
+    end
+end
+
+local function checkServerPop()
+    local cfg = getgenv().PlazaSellConfig
+    if not cfg or not cfg.AutoHop then return end
+    
+    local minPlayers = tonumber(cfg.MinPlayers) or 5
+    if #Players:GetPlayers() <= minPlayers then
+        print("[SYSTEM] Server population too low. Hopping server...")
+        serverHop()
+        task.wait(10)
+    end
+end
+
+task.spawn(function()
+    while task.wait(5) do
+        pcall(checkAndTeleport)
+        pcall(checkRAM)
+        pcall(checkRejoinTimer)
+    end
+end)
+
+task.spawn(function()
+    while task.wait(60) do
+        pcall(checkServerPop)
+    end
+end)
+
+-- ==============================================================================
+-- 7. VÒNG LẶP AUTO SELL TREO BÁN TỰ ĐỘNG (BACKGROUND AUTO-SELL ENGINE)
+-- ==============================================================================
+local mySession = math.random(100000, 999999)
+getgenv().AutoSellSession = mySession
+getgenv().PlazaSellItemCooldowns = getgenv().PlazaSellItemCooldowns or {}
+
+local function runAutoSellProcess()
+    while true do
+        task.wait(10)
+        
+        if getgenv().AutoSellSession ~= mySession then
+            break
+        end
+        
+        local cfg = getgenv().PlazaSellConfig
+        if cfg and cfg.Enabled then
+            local ok, err = pcall(function()
+                -- 1. Kiểm tra trạng thái Trading Plaza
+                local isOnPlaza = false
+                local LibraryInstance = ReplicatedStorage:FindFirstChild("Library")
+                if not LibraryInstance then return end
+                
+                local Client = LibraryInstance:FindFirstChild("Client")
+                local TradingPlazaCmds
+                local cmdModule = Client and Client:FindFirstChild("TradingPlazaCmds")
+                if cmdModule then
+                    pcall(function() TradingPlazaCmds = require(cmdModule) end)
+                end
+                
+                if TradingPlazaCmds and TradingPlazaCmds.IsOnTradingPlaza then
+                    isOnPlaza = TradingPlazaCmds.IsOnTradingPlaza()
+                else
+                    isOnPlaza = game.PlaceId == 15502339080 or game.PlaceId == 15588442388 or workspace:FindFirstChild("TradingPlaza") ~= nil
+                end
+                if not isOnPlaza then return end
+                
+                -- 2. Kiểm tra Player Global Cooldown
+                local globalCooldown = getgenv().PlazaSellGlobalCooldown
+                local globalCooldownDur = getgenv().PlazaSellGlobalCooldownDur or 120
+                if globalCooldown then
+                    local elapsed = os.time() - globalCooldown
+                    if elapsed < globalCooldownDur then
+                        if elapsed % 30 == 0 or elapsed == 0 then
+                            print(string.format("[AUTO SELL] Player cooldown active. Waiting... (%ds / %ds)", elapsed, globalCooldownDur))
+                        end
+                        return
+                    else
+                        getgenv().PlazaSellGlobalCooldown = nil
+                        getgenv().PlazaSellGlobalCooldownDur = nil
+                        getgenv().PlazaSellItemCooldowns = {}
+                        getgenv().PlazaSellListedCache = nil
+                        print("[AUTO SELL] Player cooldown expired. Resuming operation...")
+                    end
+                end
+                
+                -- 3. Hàm chiếm booth trống tốt nhất
+                local function claimBestBooth()
+                    local TradingPlaza = workspace:FindFirstChild("TradingPlaza")
+                    local BoothSpawns = TradingPlaza and TradingPlaza:FindFirstChild("BoothSpawns")
+                    if not BoothSpawns then 
+                        print("[DEBUG] Folder BoothSpawns not found in Workspace!")
+                        return false, nil 
+                    end
+                    
+                    local candidates = {}
+                    for _, child in ipairs(BoothSpawns:GetChildren()) do
+                        local idAttr = child:GetAttribute("ID")
+                        if idAttr then
+                            table.insert(candidates, {
+                                model = child,
+                                id = idAttr,
+                                numId = tonumber(idAttr) or 999
+                            })
+                        end
+                    end
+                    
+                    table.sort(candidates, function(a, b)
+                        return a.numId < b.numId
+                    end)
+                    
+                    for _, candidate in ipairs(candidates) do
+                        if candidate.model.Parent == BoothSpawns then
+                            pcall(function()
+                                if LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart") then
+                                    LocalPlayer.Character:PivotTo(candidate.model:GetPivot() * CFrame.new(0, 4.5, 4.5))
+                                end
+                            end)
+                            task.wait(0.2)
+                            
+                            local success = Network.Invoke("Booths_ClaimBooth", candidate.id)
+                            if success then
+                                print(string.format("[BOOTH] Claimed Booth #%s", tostring(candidate.id)))
+                                return true, candidate.id
+                            end
+                            task.wait(0.1)
+                        end
+                    end
+                    return false, nil
+                end
+
+                -- 4. Hàm lấy danh sách UID vật phẩm đang treo bán & số slot đang treo theo tên item / category
+                local function getListedUIDs(forceRefresh)
+                    local CACHE_TTL = 10
+                    local cache = getgenv().PlazaSellListedCache
+                    
+                    if not forceRefresh and cache and cache.ts and (os.time() - cache.ts) < CACHE_TTL then
+                        return cache.listed, cache.count, cache.slotsByName, cache.slotsByCat
+                    end
+                    
+                    local listed = {}
+                    local slotsByName = {}
+                    local slotsByCat = {}
+                    local states = nil
+                    
+                    pcall(function()
+                        local playerScripts = LocalPlayer:FindFirstChild("PlayerScripts")
+                        local BoothCmds = (Client and Client:FindFirstChild("BoothCmds")) 
+                            or (playerScripts and (playerScripts:FindFirstChild("Booths Frontend", true) or playerScripts:FindFirstChild("BoothCmds", true)))
+                            
+                        if BoothCmds and getsenv then
+                            local env = getsenv(BoothCmds)
+                            if env then
+                                local getStateFunc = env.getState or env.GetState
+                                if type(getStateFunc) == "function" then
+                                    local myState = getStateFunc(LocalPlayer)
+                                    if not myState and getupvalues then
+                                        local upvs = getupvalues(getStateFunc)
+                                        if upvs and upvs[1] and type(upvs[1]) == "table" then
+                                            myState = upvs[1][LocalPlayer] or upvs[1][LocalPlayer.UserId]
+                                        end
+                                    end
+                                    if myState and myState.Listings then
+                                        states = { [LocalPlayer] = myState }
+                                    end
+                                end
+                            end
+                        end
+                    end)
+                    
+                    if states and states[LocalPlayer] then
+                        local myState = states[LocalPlayer]
+                        local count = 0
+                        for _, listing in pairs(myState.Listings) do
+                            local itemUID = nil
+                            local listedItemName = nil
+                            local listedCat = nil
+                            
+                            if listing.Item then
+                                pcall(function() itemUID = listing.Item:GetUID() end)
+                                pcall(function() listedItemName = listing.Item:GetName() end)
+                                pcall(function()
+                                    if (listing.Item.IsHuge and listing.Item:IsHuge()) or (listedItemName and listedItemName:find("Huge")) then
+                                        listedCat = "Huge"
+                                    elseif (listing.Item.IsTitanic and listing.Item:IsTitanic()) or (listedItemName and listedItemName:find("Titanic")) then
+                                        listedCat = "Titanic"
+                                    elseif (listing.Item.IsGargantuan and listing.Item:IsGargantuan()) or (listedItemName and listedItemName:find("Gargantuan")) then
+                                        listedCat = "Gargantuan"
+                                    elseif listing.Item.GetCategory then
+                                        listedCat = listing.Item:GetCategory()
+                                    end
+                                end)
+                                if not itemUID and listing.Item._uid then itemUID = listing.Item._uid end
+                                if not itemUID and listing.Item.uid then itemUID = listing.Item.uid end
+                            end
+                            if not itemUID and listing.ItemData and listing.ItemData.uid then
+                                itemUID = listing.ItemData.uid
+                            end
+                            if not listedItemName and listing.ItemData and listing.ItemData.id then
+                                listedItemName = listing.ItemData.id
+                            end
+                            if not listedCat and listing.ItemData then
+                                listedCat = listing.ItemData._cat or listing.ItemData.cat
+                            end
+                            if listedItemName then
+                                if listedItemName:find("Huge") then listedCat = "Huge"
+                                elseif listedItemName:find("Titanic") then listedCat = "Titanic"
+                                elseif listedItemName:find("Gargantuan") then listedCat = "Gargantuan"
+                                end
+                            end
+                            
+                            if itemUID then
+                                local amt = 1
+                                if listing.Item then
+                                    pcall(function() amt = listing.Item:GetAmount() or 1 end)
+                                elseif listing.ItemData then
+                                    amt = listing.ItemData._am or listing.ItemData.am or 1
+                                end
+                                listed[itemUID] = (listed[itemUID] or 0) + amt
+                                count = count + 1
+                                if listedItemName then
+                                    slotsByName[listedItemName] = (slotsByName[listedItemName] or 0) + 1
+                                end
+                                if listedCat then
+                                    slotsByCat[listedCat] = (slotsByCat[listedCat] or 0) + 1
+                                end
+                            end
+                        end
+                        getgenv().PlazaSellListedCache = { listed = listed, count = count, slotsByName = slotsByName, slotsByCat = slotsByCat, ts = os.time() }
+                        return listed, count, slotsByName, slotsByCat
+                    end
+                    
+                    -- Fallback qua Network.Invoke
+                    local success, serverStates = pcall(function()
+                        return Network.Invoke("Booths_GetInitialState")
+                    end)
+                    if success and type(serverStates) == "table" then
+                        for k, state in pairs(serverStates) do
+                            if type(state) == "table" then
+                                local isMine = false
+                                if tostring(k) == tostring(LocalPlayer.UserId) then isMine = true end
+                                
+                                local pObj = state.Player or state.Owner or state.player or state.owner
+                                if typeof(pObj) == "Instance" and pObj:IsA("Player") and pObj.UserId == LocalPlayer.UserId then
+                                    isMine = true
+                                end
+                                
+                                local pId = state.PlayerID or state.PlayerId or state.UserId or state.OwnerId or state.PlayerUserId
+                                if pId and tostring(pId) == tostring(LocalPlayer.UserId) then
+                                    isMine = true
+                                end
+                                
+                                if isMine and state.Listings then
+                                    local count = 0
+                                    for _, listing in pairs(state.Listings) do
+                                        if listing.ItemData and listing.ItemData.uid then
+                                            local amt = listing.ItemData._am or listing.ItemData.am or 1
+                                            local iName = listing.ItemData.id
+                                            local iCat = listing.ItemData._cat or listing.ItemData.cat
+                                            if iName then
+                                                if iName:find("Huge") then iCat = "Huge"
+                                                elseif iName:find("Titanic") then iCat = "Titanic"
+                                                elseif iName:find("Gargantuan") then iCat = "Gargantuan"
+                                                end
+                                            end
+                                            listed[listing.ItemData.uid] = (listed[listing.ItemData.uid] or 0) + amt
+                                            count = count + 1
+                                            if iName then
+                                                slotsByName[iName] = (slotsByName[iName] or 0) + 1
+                                            end
+                                            if iCat then
+                                                slotsByCat[iCat] = (slotsByCat[iCat] or 0) + 1
+                                            end
+                                        end
+                                    end
+                                    getgenv().PlazaSellListedCache = { listed = listed, count = count, slotsByName = slotsByName, slotsByCat = slotsByCat, ts = os.time() }
+                                    getgenv().PlazaSellLastStateCall = os.time()
+                                    return listed, count, slotsByName, slotsByCat
+                                end
+                            end
+                        end
+                    end
+                    return listed, 0, slotsByName, slotsByCat
+                end
+
+                -- 5. Đảm bảo nhân vật đã chiếm được quầy
+                local myBooth = nil
+                pcall(function()
+                    local activeModel = Signal.Invoke("Booths_GetActiveModel")
+                    if activeModel then
+                        myBooth = activeModel
+                    end
+                end)
+                
+                if not myBooth then
+                    pcall(function()
+                        local things = workspace:FindFirstChild("__THINGS")
+                        local boothsFolder = things and things:FindFirstChild("Booths")
+                        if boothsFolder then
+                            for _, boothModel in ipairs(boothsFolder:GetChildren()) do
+                                local ownerId = boothModel:GetAttribute("Owner")
+                                if ownerId and tostring(ownerId) == tostring(LocalPlayer.UserId) then
+                                    myBooth = boothModel
+                                    break
+                                end
+                            end
+                        end
+                    end)
+                end
+                
+                if not myBooth then
+                    print("[AUTO SELL] Finding and claiming best empty booth...")
+                    local claimed, boothId = claimBestBooth()
+                    if claimed then
+                        print("[AUTO SELL] Successfully claimed Booth ID:", boothId)
+                        getgenv().PlazaSellFreshClaimTime = os.time()
+                        getgenv().PlazaSellGlobalCooldown = nil
+                        getgenv().PlazaSellGlobalCooldownDur = nil
+                        getgenv().PlazaSellItemCooldowns = {}
+                        getgenv().PlazaSellListedCache = { listed = {}, count = 0, slotsByName = {}, slotsByCat = {}, ts = os.time() }
+                        getgenv().PlazaSellSlotCache = 0
+                        task.wait(3.0)
+                    else
+                        print("[AUTO SELL] Could not claim a booth (Cooldown/Rate Limit). Retrying in 30s...")
+                        getgenv().PlazaSellGlobalCooldown = os.time()
+                        getgenv().PlazaSellGlobalCooldownDur = 30
+                        return
+                    end
+                end
+                
+                -- 6. Quét rương đồ và tìm các vật phẩm đủ điều kiện treo bán
+                local Save = require(LibraryInstance:WaitForChild("Client"):WaitForChild("Save"))
+                local Types = require(LibraryInstance:WaitForChild("Items"):WaitForChild("Types"))
+                local data = Save.Get()
+                if not data or not data.Inventory then return end
+                
+                local listedUIDs, listedCount, listedSlotsByName, listedSlotsByCat = getListedUIDs(false)
+                getgenv().PlazaSellSlotCache = listedCount
+                
+                local MAX_BOOTH_SLOTS = 25
+                if listedCount >= MAX_BOOTH_SLOTS then
+                    local lastFullLog = getgenv().PlazaSellLastFullLog or 0
+                    if os.time() - lastFullLog >= 60 then
+                        print(string.format("[AUTO SELL] Booth full (%d/%d). Monitoring for sold slots...", listedCount, MAX_BOOTH_SLOTS))
+                        getgenv().PlazaSellLastFullLog = os.time()
+                    end
+                    return
+                end
+                
+                local qualifiedQueue = {}
+                local queuedSlotsByName = {}
+                local queuedSlotsByCat = {}
+                local scanStats = { total = 0, locked = 0, noPrice = 0, cooldown = 0, alreadyListed = 0, limitReached = 0, slotsMaxed = 0 }
+                
+                for catName, catData in pairs(data.Inventory) do
+                    for uid, itemData in pairs(catData) do
+                        if not getgenv().PlazaSellConfig.Enabled then return end
+                        
+                        local success, itemObj = pcall(function() return Types.From(catName, itemData) end)
+                        if success and itemObj then
+                            local isLocked = false
+                            pcall(function() isLocked = itemObj:IsLocked() end)
+                            
+                            if isLocked then
+                                scanStats.locked = scanStats.locked + 1
+                            else
+                                local itemName = itemObj:GetName()
+                                local priceSource = "Custom (Items)"
+                                scanStats.total = scanStats.total + 1
+                                
+                                local itemCfg = getItemConfig(itemName, itemObj)
+                                local sellPrice = nil
+                                local priceSource = "Custom (Fixed)"
+                                
+                                if itemCfg then
+                                    if itemCfg.Cosmic ~= nil then
+                                        local cosmicModule = LibraryInstance:FindFirstChild("Client") and LibraryInstance.Client:FindFirstChild("CosmicCmds")
+                                        if cosmicModule then
+                                            local CosmicCmds = require(cosmicModule)
+                                            local cosmicSuccess, cosmicVal = pcall(function() return CosmicCmds.Get(itemObj) end)
+                                            if cosmicSuccess and type(cosmicVal) == "number" and cosmicVal > 0 then
+                                                local pct = itemCfg.Cosmic
+                                                sellPrice = math.max(1, math.floor(cosmicVal * (1 + pct / 100)))
+                                                priceSource = string.format("Item Cosmic (%+d%%)", pct)
+                                            end
+                                        end
+                                    elseif itemCfg.RAP ~= nil then
+                                        local RAPCmds = require(LibraryInstance:WaitForChild("Client"):WaitForChild("RAPCmds"))
+                                        local rapSuccess, rapResult = pcall(function() return RAPCmds.Get(itemObj) end)
+                                        if rapSuccess and type(rapResult) == "number" and rapResult > 0 then
+                                            local pct = itemCfg.RAP
+                                            sellPrice = math.max(1, math.floor(rapResult * (1 + pct / 100)))
+                                            priceSource = string.format("Item RAP (%+d%%)", pct)
+                                        end
+                                    elseif itemCfg.Price and itemCfg.Price > 0 then
+                                        sellPrice = itemCfg.Price
+                                        priceSource = "Custom (Fixed)"
+                                    end
+                                end
+                                
+                                local targetQty = itemCfg and itemCfg.Amount or "All"
+                                local limitVal = itemCfg and itemCfg.Limit or "All"
+                                local configuredSlots = itemCfg and itemCfg.Slots or "All"
+                                
+                                local isStackableItem = not (catName == "Pet" or catName == "Hoverboard" or catName == "Booth")
+                                
+                                -- 4. Tra cứu theo CategoryRules nếu item không nằm trong bảng Items (hoặc itemCfg không có thiết lập giá riêng)
+                                local itemCategory = catName
+                                if catName == "Pet" then
+                                    if itemObj.IsHuge and itemObj:IsHuge() then itemCategory = "Huge"
+                                    elseif itemObj.IsTitanic and itemObj:IsTitanic() then itemCategory = "Titanic"
+                                    elseif (itemObj.IsGargantuan and itemObj:IsGargantuan()) or (itemObj.Gargantuan and itemObj:Gargantuan()) or (itemName and tostring(itemName):find("Gargantuan")) then itemCategory = "Gargantuan"
+                                    end
+                                end
+                                
+                                local hasItemExplicitPrice = itemCfg and (itemCfg.Cosmic ~= nil or itemCfg.RAP ~= nil or (itemCfg.Price and itemCfg.Price > 0))
+                                if (not sellPrice or sellPrice <= 0) and not hasItemExplicitPrice then
+                                    local rule = cfg.CategoryRules and cfg.CategoryRules[itemCategory]
+                                    if rule and rule.Mode ~= "Disabled" then
+                                        if configuredSlots == "All" and rule.Slots ~= nil and rule.Slots ~= "All" then
+                                            configuredSlots = rule.Slots
+                                        end
+                                        
+                                        if rule.Mode == "Fixed" then
+                                            sellPrice = tonumber(rule.Price) or 0
+                                            priceSource = "Category (Fixed)"
+                                        elseif rule.Mode == "Cosmic" then
+                                            local cosmicModule = LibraryInstance:FindFirstChild("Client") and LibraryInstance.Client:FindFirstChild("CosmicCmds")
+                                            if cosmicModule then
+                                                local CosmicCmds = require(cosmicModule)
+                                                local cosmicSuccess, cosmicVal = pcall(function() return CosmicCmds.Get(itemObj) end)
+                                                if cosmicSuccess and type(cosmicVal) == "number" and cosmicVal > 0 then
+                                                    local pct = tonumber(rule.Percent) or 0
+                                                    sellPrice = math.max(1, math.floor(cosmicVal * (1 + pct / 100)))
+                                                    priceSource = string.format("Cosmic (%+d%%)", pct)
+                                                end
+                                            end
+                                        elseif rule.Mode == "RAP" then
+                                            local RAPCmds = require(LibraryInstance:WaitForChild("Client"):WaitForChild("RAPCmds"))
+                                            local rapSuccess, rapResult = pcall(function() return RAPCmds.Get(itemObj) end)
+                                            if rapSuccess and type(rapResult) == "number" and rapResult > 0 then
+                                                local pct = tonumber(rule.Percent) or 0
+                                                sellPrice = math.max(1, math.floor(rapResult * (1 + pct / 100)))
+                                                priceSource = string.format("RAP (%+d%%)", pct)
+                                            end
+                                        end
+                                    end
+                                end
+                                
+                                if sellPrice and sellPrice > 0 then
+                                    local totalAmtInInv = itemObj:GetAmount() or 1
+                                    local alreadyListedAmt = listedUIDs[uid] or 0
+                                    
+                                    -- Đếm số slot đang chiếm dụng (gồm đã list trên quầy + đã xếp vào queue trong tick này)
+                                    local currentOccupiedSlots = ((listedSlotsByName and (listedSlotsByName[itemName] or listedSlotsByName[itemData.id])) or 0) + (queuedSlotsByName[itemName] or 0)
+                                    if (not itemCfg) and itemCategory and listedSlotsByCat then
+                                        local catOccupied = (listedSlotsByCat[itemCategory] or 0) + (queuedSlotsByCat[itemCategory] or 0)
+                                        currentOccupiedSlots = math.max(currentOccupiedSlots, catOccupied)
+                                    end
+                                    
+                                    -- Quota còn lại được phép list lên quầy
+                                    local remQuota = (targetQty == "All") and (totalAmtInInv - alreadyListedAmt) or math.max(0, (tonumber(targetQty) or 0) - alreadyListedAmt)
+                                    
+                                    -- Tính toán số slot tối đa được phép treo cho item này trong tick này
+                                    local maxSlotsForItem
+                                    if not isStackableItem then
+                                        maxSlotsForItem = 1
+                                    elseif configuredSlots ~= "All" then
+                                        local allowedRemSlots = math.max(0, (tonumber(configuredSlots) or 1) - currentOccupiedSlots)
+                                        maxSlotsForItem = math.min(allowedRemSlots, MAX_BOOTH_SLOTS - listedCount)
+                                    elseif targetQty == "All" then
+                                        maxSlotsForItem = MAX_BOOTH_SLOTS - listedCount
+                                    else
+                                        maxSlotsForItem = math.max(1, math.ceil(remQuota / 50000))
+                                    end
+                                    
+                                    local itemCooldowns = getgenv().PlazaSellItemCooldowns
+                                    local isCoolingDown = itemCooldowns[uid] and (os.time() - itemCooldowns[uid]) < 60
+                                    local isLimitReached = limitVal ~= "All" and (tonumber(limitVal) or 0) <= 0
+                                    local isAmountReached = targetQty ~= "All" and (tonumber(targetQty) or 0) <= 0
+                                    local isQuotaSatisfied = targetQty ~= "All" and (alreadyListedAmt >= (tonumber(targetQty) or 0))
+                                    local isSlotsMaxed = configuredSlots ~= "All" and currentOccupiedSlots >= (tonumber(configuredSlots) or 1)
+                                    local isAlreadyListed = (not isStackableItem and alreadyListedAmt > 0) or (isStackableItem and (alreadyListedAmt >= totalAmtInInv or isQuotaSatisfied))
+                                    
+                                    if not isCoolingDown and not isLimitReached and not isAmountReached and not isSlotsMaxed and not isAlreadyListed and remQuota > 0 and maxSlotsForItem > 0 then
+                                        local remInv = math.min(totalAmtInInv - alreadyListedAmt, remQuota)
+                                        table.insert(qualifiedQueue, {
+                                            cat = catName,
+                                            itemCat = itemCategory,
+                                            name = itemName,
+                                            price = sellPrice,
+                                            priceSource = priceSource,
+                                            amt = remInv,
+                                            uid = uid,
+                                            limitVal = limitVal,
+                                            targetQty = remQuota,
+                                            configuredSlots = configuredSlots,
+                                            maxSlots = maxSlotsForItem,
+                                            isStackable = isStackableItem
+                                        })
+                                        queuedSlotsByName[itemName] = (queuedSlotsByName[itemName] or 0) + maxSlotsForItem
+                                        if itemCategory then
+                                            queuedSlotsByCat[itemCategory] = (queuedSlotsByCat[itemCategory] or 0) + maxSlotsForItem
+                                        end
+                                    elseif isCoolingDown then
+                                        scanStats.cooldown = scanStats.cooldown + 1
+                                    elseif isLimitReached or isAmountReached or isQuotaSatisfied then
+                                        scanStats.limitReached = scanStats.limitReached + 1
+                                    elseif isSlotsMaxed then
+                                        scanStats.slotsMaxed = scanStats.slotsMaxed + 1
+                                    elseif isAlreadyListed then
+                                        scanStats.alreadyListed = scanStats.alreadyListed + 1
+                                    end
+                                else
+                                    scanStats.noPrice = scanStats.noPrice + 1
+                                end
+                            end
+                        end
+                    end
+                end
+                
+                -- Đảm bảo khoảng cách an toàn 4s giữa GetInitialState và CreateListing
+                local lastStateCall = getgenv().PlazaSellLastStateCall
+                if lastStateCall then
+                    local gap = os.time() - lastStateCall
+                    if gap < 4 then
+                        task.wait(4 - gap)
+                    end
+                    getgenv().PlazaSellLastStateCall = nil
+                end
+                
+                -- Tiến hành đăng bán lần lượt các item trong Queue
+                local globalCooldownTriggered = false
+                local listedCountBeforeTick = listedCount
+                for _, item in ipairs(qualifiedQueue) do
+                    if not getgenv().PlazaSellConfig.Enabled then break end
+                    if listedCount >= MAX_BOOTH_SLOTS then break end
+                    
+                    local remainingInventory = item.amt
+                    local uid = item.uid
+                    local itemName = item.name
+                    local sellPrice = item.price
+                    local targetQty = item.targetQty
+                    
+                    local slotsUsedForItem = 0
+                    while remainingInventory > 0 and getgenv().PlazaSellConfig.Enabled do
+                        if listedCount >= MAX_BOOTH_SLOTS then break end
+                        if targetQty ~= "All" and (tonumber(targetQty) or 0) <= 0 then break end
+                        if item.isStackable and slotsUsedForItem >= (item.maxSlots or 1) then break end
+                        
+                        local sellAmt = remainingInventory
+                        if targetQty ~= "All" then
+                            sellAmt = math.min(remainingInventory, tonumber(targetQty) or 1)
+                        end
+                        sellAmt = math.min(sellAmt, 50000)
+                        if sellAmt <= 0 then break end
+                        
+                        local listSuccess, errMsg = Network.Invoke("Booths_CreateListing", uid, sellPrice, sellAmt)
+                        if listSuccess then
+                            listedCount = listedCount + 1
+                            slotsUsedForItem = slotsUsedForItem + 1
+                            remainingInventory = remainingInventory - sellAmt
+                            if targetQty ~= "All" then
+                                local remQ = (tonumber(targetQty) or sellAmt) - sellAmt
+                                targetQty = (remQ <= 0) and 0 or remQ
+                            end
+                            getgenv().PlazaSellSlotCache = listedCount
+                            listedUIDs[uid] = (listedUIDs[uid] or 0) + sellAmt
+                            if listedSlotsByName then
+                                listedSlotsByName[itemName] = (listedSlotsByName[itemName] or 0) + 1
+                            end
+                            if listedSlotsByCat and item.itemCat then
+                                listedSlotsByCat[item.itemCat] = (listedSlotsByCat[item.itemCat] or 0) + 1
+                            end
+                            print(string.format("[AUTO SELL] Listed %s x%s @ %s Gems (%s) [%d/%d]",
+                                itemName, formatNumber(sellAmt), formatNumber(sellPrice), item.priceSource, listedCount, MAX_BOOTH_SLOTS))
+                            task.wait(2.5)
+                        else
+                            local errStr = tostring(errMsg):lower()
+                            print(string.format("[AUTO SELL ERROR] Failed to list %s: %s", itemName, tostring(errMsg)))
+                            if errStr:find("slot") or errStr:find("full") or errStr:find("limit") or errStr:find("no empty") then
+                                listedCount = MAX_BOOTH_SLOTS
+                                break
+                            elseif errStr:find("fast") or errStr:find("too") then
+                                print(string.format("[AUTO SELL] Rate limit hit. Pausing 8s..."))
+                                task.wait(8.0)
+                                break
+                            elseif errStr:find("cooldown") or errStr:find("wait") then
+                                if listedCount == listedCountBeforeTick then
+                                    local prevDur = getgenv().PlazaSellGlobalCooldownDur or 60
+                                    local nextDur = math.min(prevDur * 2, 300)
+                                    getgenv().PlazaSellGlobalCooldown = os.time()
+                                    getgenv().PlazaSellGlobalCooldownDur = nextDur
+                                    print(string.format("[AUTO SELL] Cooldown active! Waiting %ds...", nextDur))
+                                    globalCooldownTriggered = true
+                                    break
+                                else
+                                    getgenv().PlazaSellItemCooldowns[uid] = os.time()
+                                    task.wait(3.0)
+                                end
+                                break
+                            end
+                            getgenv().PlazaSellItemCooldowns[uid] = os.time()
+                            break
+                        end
+                    end
+                    if globalCooldownTriggered then break end
+                end
+            end)
+            if not ok then
+                print("[AUTO SELL PROCESS ERROR]", tostring(err))
+            end
+        end
+    end
+end
+
+task.spawn(runAutoSellProcess)
