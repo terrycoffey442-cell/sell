@@ -1,3 +1,4 @@
+-- gay
 local scriptStartTime = os.clock()
 
 if not game:IsLoaded() then
@@ -19,8 +20,9 @@ local hookfunction = env.hookfunction
 if getgenv().SellHugeCV_Running then
     print("[SellHugeCV] Previous engine instance detected. Stopping previous runner...")
     getgenv().SellHugeCV_Running = false
-    task.wait(1.0)
 end
+local mySessionId = HttpService:GenerateGUID(false)
+getgenv().SellHugeCV_SessionId = mySessionId
 getgenv().SellHugeCV_Running = true
 
 local lp = Players.LocalPlayer or Players:GetPropertyChangedSignal("LocalPlayer"):Wait()
@@ -240,35 +242,39 @@ local function EnsureInTradingPlaza()
     elseif Config.PlazaType == "Normal Plaza" then
         targetPlaceId = normalId
     else
-        if TradingPlazaCmds and TradingPlazaCmds.GetAvailable then
-            local ok, av = pcall(function() return TradingPlazaCmds.GetAvailable() end)
-            if ok and av and #av > 0 then
-                local chosen = av[1]
-                for _, p in ipairs(av) do
-                    if p.PlaceId == proId then
-                        chosen = p
-                        break
-                    end
+        local save = Save.Get()
+        local hugeCount, titanicCount, gargCount = 0, 0, 0
+        if save and save.Inventory and save.Inventory.Pet then
+            for _, pData in pairs(save.Inventory.Pet) do
+                local idStr = tostring(pData.id or "")
+                local amt = pData._am or 1
+                if idStr:find("Gargantuan") then
+                    gargCount = gargCount + amt
+                elseif idStr:find("Titanic") then
+                    titanicCount = titanicCount + amt
+                elseif idStr:find("Huge") then
+                    hugeCount = hugeCount + amt
                 end
-                targetPlaceId = chosen.PlaceId or normalId
             end
+        end
+        if hugeCount >= 50 or titanicCount >= 5 or gargCount >= 1 then
+            targetPlaceId = proId
+        else
+            targetPlaceId = normalId
         end
     end
 
     print(string.format("[SellHugeCV] Requesting teleport to Trading Plaza (PlaceId: %d)...", targetPlaceId))
     task.wait(1.0)
 
-    local teleported = false
-    if TradingPlazaCmds and TradingPlazaCmds.RequestTradingPlaza then
-        local ok = pcall(function()
-            TradingPlazaCmds.RequestTradingPlaza(targetPlaceId)
-        end)
-        if ok then teleported = true end
-    end
+    local ok, res, errMsg = pcall(function()
+        return Network.Invoke("Travel to Trading Plaza", targetPlaceId)
+    end)
 
-    if not teleported then
+    if (not ok or not res) and targetPlaceId == proId then
+        warn(string.format("[SellHugeCV] Pro Plaza rejected (%s). Falling back to Normal Plaza (%d)...", tostring(errMsg or res), normalId))
         pcall(function()
-            Network.Invoke("Travel to Trading Plaza", targetPlaceId)
+            Network.Invoke("Travel to Trading Plaza", normalId)
         end)
     end
 
@@ -886,14 +892,14 @@ end
 
 task.spawn(function()
     print("[SellHugeCV] Auto Sell Huge CV Engine started successfully.")
-    while getgenv().SellHugeCV_Running do
+    while getgenv().SellHugeCV_Running and getgenv().SellHugeCV_SessionId == mySessionId do
         if Config.Enabled then
             RunListingCycle()
         end
 
         local waitElapsed = 0
         local checkStep = 0.5
-        while waitElapsed < Config.CycleInterval do
+        while waitElapsed < Config.CycleInterval and getgenv().SellHugeCV_Running and getgenv().SellHugeCV_SessionId == mySessionId do
             if triggerImmediateCycle then
 
                 local elapsedSinceSale = os.clock() - lastSaleTime
