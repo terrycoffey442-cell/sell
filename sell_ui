@@ -1,0 +1,920 @@
+local scriptStartTime = os.clock()
+
+if not game:IsLoaded() then
+    game.Loaded:Wait()
+end
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local HttpService = game:GetService("HttpService")
+local VirtualUser = game:GetService("VirtualUser")
+local TeleportService = game:GetService("TeleportService")
+
+local env = getfenv()
+local getgenv = env.getgenv or function() return _G end
+local setreadonly = env.setreadonly or env.make_writeable or function() end
+local hookfunction = env.hookfunction
+
+if getgenv().SellHugeCV_Running then
+    print("[SellHugeCV] Previous engine instance detected. Stopping previous runner...")
+    getgenv().SellHugeCV_Running = false
+    task.wait(1.0)
+end
+getgenv().SellHugeCV_Running = true
+
+local lp = Players.LocalPlayer or Players:GetPropertyChangedSignal("LocalPlayer"):Wait()
+
+local function WaitForCharacter()
+    local char = lp.Character
+    local timeout = 0
+    while not (char and char:FindFirstChild("HumanoidRootPart")) and timeout < 10 do
+        task.wait(0.5)
+        timeout = timeout + 0.5
+        char = lp.Character
+    end
+    return char
+end
+WaitForCharacter()
+
+local Library = ReplicatedStorage:WaitForChild("Library", 15)
+if not Library then
+    warn("[SellHugeCV] ReplicatedStorage.Library not found")
+    return
+end
+
+local dynamicRequire = env.require or require
+
+local Client = Library:WaitForChild("Client", 15)
+local Network = dynamicRequire(Client:WaitForChild("Network"))
+local Save = dynamicRequire(Client:WaitForChild("Save"))
+local Signal = dynamicRequire(Library:WaitForChild("Signal"))
+local RAPCmds = dynamicRequire(Client:WaitForChild("RAPCmds"))
+local AbstractItem = dynamicRequire(Library:WaitForChild("Items"):WaitForChild("AbstractItem"))
+local Types = dynamicRequire(Library:WaitForChild("Items"):WaitForChild("Types"))
+local CurrencyCmds = nil
+pcall(function()
+    CurrencyCmds = dynamicRequire(Client:WaitForChild("CurrencyCmds", 5))
+end)
+
+local PlaceFile = nil
+local TradingPlazaCmds = nil
+pcall(function()
+    local modules = Library:FindFirstChild("Modules")
+    if modules and modules:FindFirstChild("PlaceFile") then
+        PlaceFile = dynamicRequire(modules.PlaceFile)
+    end
+    if Client:FindFirstChild("TradingPlazaCmds") then
+        TradingPlazaCmds = dynamicRequire(Client.TradingPlazaCmds)
+    end
+end)
+
+local DefaultConfig = {
+    Enabled = true,
+    UnderPercent = 10,
+    MinPrice = 1000000,
+    MaxSlots = 25,
+    ListingDelay = 2.5,
+    CycleInterval = 5.0,
+    AutoClaimBooth = true,
+    AutoJoinTrading = true,
+    PlazaType = "Auto Select",
+    DiscordWebhook = "https://discord.com/api/webhooks/1397922298501005433/GEYiKwB5LYJ2zP5k9EZDMrNeE2Hl6tJKSjZsi4q1-prT7PW-49ylG61Orx_dR73DgDaf",
+    SortOrder = "LowestPrice",
+}
+
+local Config = getgenv().SellHugeCVConfig or {}
+for k, v in pairs(DefaultConfig) do
+    if Config[k] == nil then
+        Config[k] = v
+    end
+end
+
+if Config.DiscordWebhook == "" and Config.WebhookURL and Config.WebhookURL ~= "" then
+    Config.DiscordWebhook = Config.WebhookURL
+end
+
+getgenv().SellHugeCVConfig = Config
+
+if not getgenv().SellHugeCV_AFKPatched then
+    pcall(function()
+        local getconnections = env.getconnections or getgenv().getconnections
+        if getconnections then
+            local conns = getconnections(RunService.RenderStepped)
+            for _, conn in ipairs(conns) do
+                local fn = conn.Function
+                if fn then
+                    local info = debug.getinfo(fn)
+                    local src = info and info.source or ""
+                    if src:find("Idle Tracking") then
+                        conn:Disconnect()
+                        print("[SellHugeCV] Disconnected PS99 Idle Tracking RenderStepped connection")
+                    end
+                end
+            end
+        end
+
+        local scriptsFolder = lp:WaitForChild("PlayerScripts", 10):FindFirstChild("Scripts")
+        local core = scriptsFolder and scriptsFolder:FindFirstChild("Core")
+        local idleScript = core and core:FindFirstChild("Idle Tracking")
+        if idleScript and idleScript:IsA("LocalScript") then
+            idleScript.Disabled = true
+            print("[SellHugeCV] Disabled PlayerScripts.Scripts.Core['Idle Tracking']")
+        end
+    end)
+end
+
+if not getgenv().SellHugeCV_NetworkHooked then
+    getgenv().SellHugeCV_NetworkHooked = true
+    pcall(function()
+        if setreadonly then setreadonly(Network, false) end
+        local originalFire
+        originalFire = hookfunction(Network.Fire, function(remoteName, ...)
+            if remoteName == "Move Server" then
+                print("[SellHugeCV] Blocked PS99 Move Server remote call")
+                return nil
+            end
+            return originalFire(remoteName, ...)
+        end)
+        print("[SellHugeCV] Network.Fire ('Move Server') hooked successfully")
+    end)
+end
+
+if not getgenv().SellHugeCV_AFKPatched then
+    getgenv().SellHugeCV_AFKPatched = true
+    pcall(function()
+        lp.Idled:Connect(function()
+            if VirtualUser then
+                VirtualUser:CaptureController()
+                VirtualUser:ClickButton2(Vector2.zero)
+                print("[SellHugeCV] Native Idled event handled via VirtualUser")
+            end
+        end)
+        print("[SellHugeCV] Native Idled listener attached")
+    end)
+
+    task.spawn(function()
+        while true do
+            task.wait(180)
+            pcall(function()
+                if VirtualUser then
+                    VirtualUser:CaptureController()
+                    VirtualUser:ClickButton2(Vector2.zero)
+                end
+                if Network and Network.Fire then
+                    Network.Fire("Idle Tracking: Stop Timer")
+                end
+            end)
+        end
+    end)
+end
+
+local function FormatNumber(n)
+    if not n or type(n) ~= "number" then return "0" end
+    if n >= 1e12 then
+        return string.format("%.2fT", n / 1e12)
+    elseif n >= 1e9 then
+        return string.format("%.2fB", n / 1e9)
+    elseif n >= 1e6 then
+        return string.format("%.2fM", n / 1e6)
+    elseif n >= 1e3 then
+        return string.format("%.1fK", n / 1e3)
+    else
+        return tostring(math.floor(n))
+    end
+end
+
+local function GetMyClaimedBoothModel()
+    local success, model = pcall(function()
+        return Signal.Invoke("Booths_GetActiveModel")
+    end)
+    if success and model and model:IsA("Model") then
+        return model
+    end
+    return nil
+end
+
+local function IsInTradingPlaza()
+    if TradingPlazaCmds and TradingPlazaCmds.IsOnTradingPlaza then
+        local ok, res = pcall(function() return TradingPlazaCmds.IsOnTradingPlaza() end)
+        if ok and res ~= nil then return res end
+    end
+    local placeId = game.PlaceId
+    if placeId == 15502339080 or placeId == 15588442388 then
+        return true
+    end
+    if PlaceFile and PlaceFile.IsTradingPlaza ~= nil then
+        return PlaceFile.IsTradingPlaza == true
+    end
+    return workspace:FindFirstChild("TradingPlaza") ~= nil
+end
+
+local isTeleporting = false
+local function EnsureInTradingPlaza()
+    if IsInTradingPlaza() then
+        return true
+    end
+
+    if not Config.AutoJoinTrading then
+        warn("[SellHugeCV] Player is not in Trading Plaza and AutoJoinTrading is disabled")
+        return false
+    end
+
+    if isTeleporting then
+        return false
+    end
+    isTeleporting = true
+
+    print("[SellHugeCV] Main world detected. Preparing teleport to Trading Plaza...")
+
+    local normalId = 15502339080
+    local proId = 15588442388
+    if PlaceFile and PlaceFile.LocalPlaces then
+        normalId = PlaceFile.LocalPlaces.Trading or normalId
+        proId = PlaceFile.LocalPlaces.ProTrading or proId
+    end
+
+    local targetPlaceId = normalId
+    if Config.PlazaType == "Pro Plaza" then
+        targetPlaceId = proId
+    elseif Config.PlazaType == "Normal Plaza" then
+        targetPlaceId = normalId
+    else
+        if TradingPlazaCmds and TradingPlazaCmds.GetAvailable then
+            local ok, av = pcall(function() return TradingPlazaCmds.GetAvailable() end)
+            if ok and av and #av > 0 then
+                local chosen = av[1]
+                for _, p in ipairs(av) do
+                    if p.PlaceId == proId then
+                        chosen = p
+                        break
+                    end
+                end
+                targetPlaceId = chosen.PlaceId or normalId
+            end
+        end
+    end
+
+    print(string.format("[SellHugeCV] Requesting teleport to Trading Plaza (PlaceId: %d)...", targetPlaceId))
+    task.wait(1.0)
+
+    local teleported = false
+    if TradingPlazaCmds and TradingPlazaCmds.RequestTradingPlaza then
+        local ok = pcall(function()
+            TradingPlazaCmds.RequestTradingPlaza(targetPlaceId)
+        end)
+        if ok then teleported = true end
+    end
+
+    if not teleported then
+        pcall(function()
+            Network.Invoke("Travel to Trading Plaza", targetPlaceId)
+        end)
+    end
+
+    task.wait(5.0)
+    isTeleporting = false
+    return false
+end
+
+local function EnsureBoothClaimed()
+    if GetMyClaimedBoothModel() then
+        return true
+    end
+
+    if not Config.AutoClaimBooth then
+        warn("[SellHugeCV] Player has no claimed booth and AutoClaimBooth is disabled")
+        return false
+    end
+
+    if Signal and Signal.Invoke then
+        local loaded = false
+        for _ = 1, 40 do
+            local ok, res = pcall(function() return Signal.Invoke("Booths_IsLoaded") end)
+            if ok and res == true then
+                loaded = true
+                break
+            end
+            task.wait(0.5)
+        end
+        if not loaded then
+            warn("[SellHugeCV] Booths system is still initializing, waiting...")
+        end
+    end
+
+    if GetMyClaimedBoothModel() then
+        return true
+    end
+
+    print("[SellHugeCV] LocalPlayer has no booth. Attempting to claim any available booth...")
+
+    local activeBooths = {}
+    pcall(function()
+        activeBooths = Signal.Invoke("Booths_Get_Active") or {}
+    end)
+    local placeholders = {}
+    pcall(function()
+        placeholders = Signal.Invoke("Booths_Get_Placeholder") or {}
+    end)
+
+    local availableIds = {}
+    for idStr, _ in pairs(placeholders) do
+        if not activeBooths[idStr] then
+            table.insert(availableIds, tostring(idStr))
+        end
+    end
+
+    if #availableIds == 0 then
+        for i = 1, 50 do
+            local idStr = tostring(i)
+            if not activeBooths[idStr] then
+                table.insert(availableIds, idStr)
+            end
+        end
+    end
+
+    for _, idStr in ipairs(availableIds) do
+        local claimOk, claimRes = pcall(function()
+            return Network.Invoke("Booths_ClaimBooth", idStr)
+        end)
+        if claimOk and claimRes then
+            print(string.format("[SellHugeCV] Successfully claimed booth ID: %s", idStr))
+            task.wait(1.0)
+            return true
+        end
+        task.wait(0.1)
+    end
+
+    warn("[SellHugeCV] Failed to claim any booth in this server (all occupied or throttled)")
+    return false
+end
+
+local cosmicWebCache = getgenv().SellHugeCV_CosmicCache or {}
+getgenv().SellHugeCV_CosmicCache = cosmicWebCache
+local COSMIC_CACHE_TTL = 1800
+
+local myListingsCache = {}
+local listedMetaCache = {}
+local isListingsInitialized = false
+
+pcall(function()
+    Network.Fired("Booths_Broadcast"):Connect(function(player, rawPacket)
+        if player == lp or (rawPacket and rawPacket.PlayerID == lp.UserId) then
+            myListingsCache = {}
+            if rawPacket and rawPacket.Listings then
+                for listingKey, lData in pairs(rawPacket.Listings) do
+                    local itemUid = (lData.ItemData and lData.ItemData.uid) or (lData.Item and type(lData.Item.GetUID) == "function" and lData.Item:GetUID()) or listingKey
+                    myListingsCache[itemUid] = lData
+                end
+            end
+            isListingsInitialized = true
+        end
+    end)
+end)
+
+local function GetHttpRequestFn()
+    return (syn and syn.request) or (http and http.request) or http_request or request
+end
+
+local function HttpGetUrl(url)
+    local ok, res = pcall(function()
+        return game:HttpGet(url)
+    end)
+    if ok and type(res) == "string" and #res > 0 then
+        return res
+    end
+    local reqFn = GetHttpRequestFn()
+    if reqFn then
+        local reqOk, reqRes = pcall(function()
+            return reqFn({ Url = url, Method = "GET" })
+        end)
+        if reqOk and reqRes and type(reqRes.Body) == "string" then
+            return reqRes.Body
+        end
+    end
+    return nil
+end
+
+local function ParseCosmicNumber(str)
+    if type(str) == "number" then
+        return math.floor(str)
+    end
+    if type(str) ~= "string" then
+        return nil
+    end
+    local cleaned = str:upper():gsub("%s+", ""):gsub(",", "")
+    if cleaned == "" or cleaned == "SOON" or cleaned == "N/A" or cleaned == "O/C" then
+        return nil
+    end
+    local mult = 1
+    if cleaned:sub(-1) == "K" then
+        mult = 1e3
+        cleaned = cleaned:sub(1, -2)
+    elseif cleaned:sub(-1) == "M" then
+        mult = 1e6
+        cleaned = cleaned:sub(1, -2)
+    elseif cleaned:sub(-1) == "B" then
+        mult = 1e9
+        cleaned = cleaned:sub(1, -2)
+    elseif cleaned:sub(-1) == "T" then
+        mult = 1e12
+        cleaned = cleaned:sub(1, -2)
+    end
+    local num = tonumber(cleaned)
+    if not num or num <= 0 then
+        return nil
+    end
+    return math.floor(num * mult)
+end
+
+local function ParseCosmicDemand(str)
+    if type(str) == "number" then
+        return str, math.round(str * 10)
+    end
+    if type(str) ~= "string" then
+        return nil, nil
+    end
+    local numStr = str:match("^(%d+%.?%d*)%s*/%s*10$") or str:match("^(%d+%.?%d*)$")
+    local scale = tonumber(numStr)
+    if not scale then
+        return nil, nil
+    end
+    return scale / 10, math.round(scale)
+end
+
+local function BuildCosmicQueryName(pData)
+    local prefix = ""
+    if pData.sh == true then
+        prefix = prefix .. "Shiny "
+    end
+    if pData.pt == 1 then
+        prefix = prefix .. "Golden "
+    elseif pData.pt == 2 then
+        prefix = prefix .. "Rainbow "
+    end
+    return prefix .. tostring(pData.id)
+end
+
+local function FetchExternalCosmic(pData)
+    local queryName = BuildCosmicQueryName(pData)
+    local now = os.clock()
+    local cached = cosmicWebCache[queryName]
+    if cached and (now - cached.fetchedAt) < COSMIC_CACHE_TTL then
+        return cached.value, cached.demand, cached.demandScale, queryName
+    end
+
+    local url = "https://petsimulatorvalues.com/values.php?item=" .. HttpService:UrlEncode(queryName)
+    local raw = HttpGetUrl(url)
+    if not raw then
+        return nil, nil, nil, queryName
+    end
+
+    local ok, decoded = pcall(function()
+        return HttpService:JSONDecode(raw)
+    end)
+    local itemData = ok and type(decoded) == "table" and decoded.item or nil
+    local cosmicVal = itemData and ParseCosmicNumber(itemData.value) or nil
+    local cosmicDemand, demandScale = nil, nil
+    if itemData then
+        cosmicDemand, demandScale = ParseCosmicDemand(itemData.demand)
+    end
+
+    cosmicWebCache[queryName] = {
+        value = cosmicVal,
+        demand = cosmicDemand,
+        demandScale = demandScale,
+        rawValue = itemData and itemData.value or "N/A",
+        rawDemand = itemData and itemData.demand or "N/A",
+        fetchedAt = now
+    }
+
+    if cosmicVal and demandScale then
+        print(string.format("[SellHugeCV] Cosmic fetched: %s -> Value: %s | Demand: %d/10",
+            queryName, FormatNumber(cosmicVal), demandScale))
+    else
+        print(string.format("[SellHugeCV] Cosmic skipped (unpriced): %s -> Value: %s | Demand: %s",
+            queryName, tostring(itemData and itemData.value or "nil"), tostring(itemData and itemData.demand or "nil")))
+    end
+
+    return cosmicVal, cosmicDemand, demandScale, queryName
+end
+
+local function ExtractAssetInfo(itemObj, pData)
+    local rawIcon = nil
+    if itemObj and type(itemObj.GetIcon) == "function" then
+        pcall(function()
+            rawIcon = itemObj:GetIcon()
+        end)
+    end
+    if not rawIcon and pData and Types and Types.From then
+        pcall(function()
+            local tempItem = Types.From("Pet", pData)
+            if tempItem and type(tempItem.GetIcon) == "function" then
+                rawIcon = tempItem:GetIcon()
+            end
+        end)
+    end
+    local numericId = rawIcon and tostring(rawIcon):match("%d+") or nil
+    local rbxAssetStr = numericId and ("rbxassetid://" .. numericId) or tostring(rawIcon or "N/A")
+    local thumbUrl = numericId and ("https://biggamesapi.io/image/" .. numericId) or ""
+    return numericId or "N/A", rbxAssetStr, thumbUrl
+end
+
+local function GetPlayerDiamonds()
+    if CurrencyCmds and type(CurrencyCmds.Get) == "function" then
+        local ok, amt = pcall(function()
+            return CurrencyCmds.Get("Diamonds")
+        end)
+        if ok and type(amt) == "number" then
+            return amt
+        end
+    end
+    local save = Save.Get()
+    if save and type(save.Diamonds) == "number" then
+        return save.Diamonds
+    end
+    return 0
+end
+
+local function GetMyActiveListings()
+    return myListingsCache
+end
+
+local function CountActiveListings(listingsTable)
+    local count = 0
+    for _ in pairs(listingsTable) do
+        count = count + 1
+    end
+    return count
+end
+
+local function GetMaxAllowedSlots()
+    local save = Save.Get()
+    local unlockedSlots = (save and save.BoothSlots) or 4
+    return math.min(unlockedSlots, Config.MaxSlots or 25)
+end
+
+local function ScanEligibleHugePets(activeListings, maxNeeded)
+    local save = Save.Get()
+    if not (save and save.Inventory and save.Inventory.Pet) then
+        return {}
+    end
+
+    local eligible = {}
+    local needed = maxNeeded or 25
+    local maxBuffer = math.min(needed * 2, 50)
+
+    for uid, pData in pairs(save.Inventory.Pet) do
+        if not activeListings[uid] and not pData.l and not pData._lk and not (pData._am and pData._am <= 0) then
+            local id = pData.id
+
+            if type(id) == "string" and (id:find("Huge") or id:find("Titanic") or id:find("Gargantuan")) then
+                local cosmicVal, cosmicDemand, demandScale, fullName = FetchExternalCosmic(pData)
+
+                if cosmicVal and cosmicDemand ~= nil and cosmicVal >= Config.MinPrice then
+                    local targetPrice = math.floor(cosmicVal * (1 - (Config.UnderPercent / 100)))
+                    targetPrice = math.max(targetPrice, Config.MinPrice)
+
+                    local itemObj = AbstractItem:Get(uid)
+                    local assetId, rbxAssetId, thumbUrl = ExtractAssetInfo(itemObj, pData)
+
+                    local entryData = {
+                        UID = uid,
+                        Id = id,
+                        FullName = fullName or id,
+                        BaseValue = cosmicVal,
+                        TargetPrice = targetPrice,
+                        Demand = cosmicDemand,
+                        DemandScale = demandScale or math.round(cosmicDemand * 10),
+                        Source = "CosmicWeb",
+                        IsShiny = pData.sh == true,
+                        Pt = pData.pt,
+                        AssetId = assetId,
+                        RbxAssetId = rbxAssetId,
+                        ThumbUrl = thumbUrl
+                    }
+
+                    if #eligible < maxBuffer then
+                        table.insert(eligible, entryData)
+                    elseif Config.SortOrder == "LowestPrice" then
+                        local worstIdx = 1
+                        local worstPrice = eligible[1].TargetPrice
+                        for idx = 2, #eligible do
+                            if eligible[idx].TargetPrice > worstPrice then
+                                worstPrice = eligible[idx].TargetPrice
+                                worstIdx = idx
+                            end
+                        end
+                        if targetPrice < worstPrice then
+                            eligible[worstIdx] = entryData
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    if Config.SortOrder == "HighestDemand" then
+        table.sort(eligible, function(a, b)
+            if a.Demand == b.Demand then
+                return a.TargetPrice < b.TargetPrice
+            end
+            return a.Demand > b.Demand
+        end)
+    elseif Config.SortOrder == "LowestPrice" then
+        table.sort(eligible, function(a, b)
+            return a.TargetPrice < b.TargetPrice
+        end)
+    elseif Config.SortOrder == "HighestPrice" then
+        table.sort(eligible, function(a, b)
+            return a.TargetPrice > b.TargetPrice
+        end)
+    end
+
+    return eligible
+end
+
+local function SendWebhookLog(title, fields, thumbUrl, color)
+    local webhookUrl = Config.DiscordWebhook or Config.WebhookURL
+    if not webhookUrl or webhookUrl == "" then
+        return
+    end
+    task.spawn(function()
+        local embed = {
+            title = title,
+            color = color or 65280,
+            fields = fields,
+            footer = {
+                text = string.format("SellHugeCV | Player: %s | %s", lp.Name, os.date("%H:%M:%S"))
+            },
+            timestamp = DateTime.now():ToIsoDate()
+        }
+        if thumbUrl and thumbUrl ~= "" then
+            embed.thumbnail = { url = thumbUrl }
+        end
+        local payload = {
+            embeds = { embed }
+        }
+        local requestFn = GetHttpRequestFn()
+        if requestFn then
+            pcall(function()
+                requestFn({
+                    Url = webhookUrl,
+                    Method = "POST",
+                    Headers = { ["Content-Type"] = "application/json" },
+                    Body = HttpService:JSONEncode(payload)
+                })
+            end)
+        end
+    end)
+end
+
+local triggerImmediateCycle = false
+local lastSaleTime = 0
+
+Network.Fired("Booths: Add History"):Connect(function(entry)
+    if not entry then return end
+
+    local receivedDiamonds = 0
+    local soldItemsList = {}
+
+    local decodedOk = false
+    if Types and type(Types.DecodeUnpacked) == "function" then
+        pcall(function()
+            local received = Types.DecodeUnpacked(entry.Received)
+            local given = Types.DecodeUnpacked(entry.Given)
+            local isSale = true
+
+            for _, item in ipairs(received or {}) do
+                if type(item.IsA) == "function" and item:IsA("Currency") then
+                    receivedDiamonds = math.max(receivedDiamonds, (type(item.GetAmount) == "function" and item:GetAmount()) or 0)
+                else
+                    isSale = false
+                end
+            end
+
+            if isSale then
+                for _, item in ipairs(given or {}) do
+                    if not (type(item.IsA) == "function" and item:IsA("Currency")) then
+                        local uid = type(item.GetUID) == "function" and item:GetUID() or nil
+                        local meta = uid and listedMetaCache[uid] or nil
+                        local itemName = (meta and meta.FullName) or (type(item.GetName) == "function" and item:GetName()) or "Huge Pet"
+                        local assetId, rbxAssetId, thumbUrl = ExtractAssetInfo(item, nil)
+                        if meta and meta.AssetId and meta.AssetId ~= "N/A" then
+                            assetId = meta.AssetId
+                            rbxAssetId = meta.RbxAssetId
+                            thumbUrl = meta.ThumbUrl
+                        end
+                        if uid then
+                            myListingsCache[uid] = nil
+                            listedMetaCache[uid] = nil
+                        end
+                        table.insert(soldItemsList, {
+                            Name = itemName,
+                            AssetId = assetId,
+                            RbxAssetId = rbxAssetId,
+                            ThumbUrl = thumbUrl,
+                            Meta = meta
+                        })
+                    end
+                end
+            end
+            decodedOk = true
+        end)
+    end
+
+    if not decodedOk then
+        if entry.Received and entry.Received.Currency then
+            for _, cur in pairs(entry.Received.Currency) do
+                if cur.id == "Diamonds" then
+                    receivedDiamonds = receivedDiamonds + (cur._am or 0)
+                end
+            end
+        end
+        if entry.Given and entry.Given.Pet then
+            for _, pet in pairs(entry.Given.Pet) do
+                local uid = pet._uid
+                local meta = uid and listedMetaCache[uid] or nil
+                local assetId, rbxAssetId, thumbUrl = ExtractAssetInfo(nil, pet)
+                if uid then
+                    myListingsCache[uid] = nil
+                    listedMetaCache[uid] = nil
+                end
+                table.insert(soldItemsList, {
+                    Name = (meta and meta.FullName) or pet.id or "Pet",
+                    AssetId = (meta and meta.AssetId) or assetId,
+                    RbxAssetId = (meta and meta.RbxAssetId) or rbxAssetId,
+                    ThumbUrl = (meta and meta.ThumbUrl) or thumbUrl,
+                    Meta = meta
+                })
+            end
+        end
+    end
+
+    if #soldItemsList > 0 then
+        local namesList = {}
+        local assetList = {}
+        local primaryThumb = ""
+        for _, sItem in ipairs(soldItemsList) do
+            table.insert(namesList, sItem.Name)
+            table.insert(assetList, string.format("%s (%s)", tostring(sItem.AssetId), tostring(sItem.RbxAssetId)))
+            if primaryThumb == "" and sItem.ThumbUrl and sItem.ThumbUrl ~= "" then
+                primaryThumb = sItem.ThumbUrl
+            end
+        end
+
+        local namesStr = table.concat(namesList, ", ")
+        local assetsStr = table.concat(assetList, "\n")
+        print(string.format("[SellHugeCV] SALE RECORDED: Sold %s (AssetId: %s) for %s Gems!",
+            namesStr, tostring(soldItemsList[1].AssetId), FormatNumber(receivedDiamonds)))
+
+        SendWebhookLog("Huge Sold from Booth", {
+            { name = "Pet(s)", value = namesStr, inline = true },
+            { name = "Gems Received", value = FormatNumber(receivedDiamonds) .. " Gems", inline = true },
+            { name = "Asset ID", value = assetsStr, inline = false },
+            { name = "Current Diamonds", value = FormatNumber(GetPlayerDiamonds()) .. " Gems", inline = true },
+            { name = "Buyer UserId", value = tostring(entry.OtherUserId or "N/A"), inline = true }
+        }, primaryThumb, 5814783)
+
+        lastSaleTime = os.clock()
+        triggerImmediateCycle = true
+    end
+end)
+
+local function RunListingCycle()
+    if not Config.Enabled then
+        return
+    end
+
+    if not IsInTradingPlaza() then
+        EnsureInTradingPlaza()
+        return
+    end
+
+    local boothClaimed = EnsureBoothClaimed()
+    if boothClaimed ~= true then
+        return
+    end
+
+    local activeListings = GetMyActiveListings()
+    local currentListingCount = CountActiveListings(activeListings)
+    local maxSlots = GetMaxAllowedSlots()
+    local freeSlots = maxSlots - currentListingCount
+
+    if freeSlots <= 0 then
+        return
+    end
+
+    local eligiblePets = ScanEligibleHugePets(activeListings, freeSlots)
+    if #eligiblePets == 0 then
+        return
+    end
+
+    print(string.format("[SellHugeCV] Scan: %d active listings / %d max slots (%d free). Found %d eligible Huge pets.",
+        currentListingCount, maxSlots, freeSlots, #eligiblePets))
+
+    local toListCount = math.min(freeSlots, #eligiblePets)
+
+    for i = 1, toListCount do
+        if not Config.Enabled then break end
+
+        local target = eligiblePets[i]
+
+        local itemObj = AbstractItem:Get(target.UID)
+        if not itemObj then continue end
+        if type(itemObj.GetAmount) == "function" and itemObj:GetAmount() < 1 then
+            activeListings[target.UID] = true
+            continue
+        end
+        if type(itemObj.IsLocked) == "function" and itemObj:IsLocked() then
+            activeListings[target.UID] = true
+            continue
+        end
+        if type(itemObj.IsEquipped) == "function" and itemObj:IsEquipped() then
+            continue
+        end
+        if type(itemObj.IsTradable) == "function" and not itemObj:IsTradable() then
+            continue
+        end
+
+        local ok, res, errDetail = pcall(function()
+            return Network.Invoke("Booths_CreateListing", target.UID, target.TargetPrice, 1)
+        end)
+
+        if ok and res then
+            print(string.format("[SellHugeCV] LISTED SUCCESS: %s (AssetId: %s) | Price: %s Gems (CV: %s, -%d%%, Demand: %d/10)",
+                target.FullName or target.Id,
+                tostring(target.AssetId),
+                FormatNumber(target.TargetPrice),
+                FormatNumber(target.BaseValue),
+                Config.UnderPercent,
+                target.DemandScale
+            ))
+            activeListings[target.UID] = true
+            myListingsCache[target.UID] = true
+            listedMetaCache[target.UID] = target
+            currentListingCount = currentListingCount + 1
+
+            SendWebhookLog("Huge Listed on Booth", {
+                { name = "Pet", value = target.FullName or target.Id, inline = true },
+                { name = "Listed Price", value = FormatNumber(target.TargetPrice) .. " Gems", inline = true },
+                { name = "Cosmic Value", value = string.format("%s (-%d%% | Demand: %d/10)", FormatNumber(target.BaseValue), Config.UnderPercent, target.DemandScale), inline = false },
+                { name = "Asset ID", value = string.format("%s (%s)", tostring(target.AssetId), tostring(target.RbxAssetId)), inline = false },
+                { name = "Booth Slots", value = string.format("%d / %d", currentListingCount, maxSlots), inline = true }
+            }, target.ThumbUrl, 65280)
+        else
+            local errStr = tostring(errDetail or res or "Unknown"):lower()
+            warn(string.format("[SellHugeCV] LIST FAILED for %s: %s", target.FullName or target.Id, errStr))
+
+            if errStr:find("fast") or errStr:find("too") or errStr:find("cooldown") or errStr:find("later") then
+                print("[SellHugeCV] Rate limit / cooldown hit. Pausing 5.0 seconds...")
+                task.wait(5.0)
+                break
+            elseif errStr:find("slot") or errStr:find("full") or errStr:find("max") then
+                print("[SellHugeCV] Booth slot limit reached. Ending cycle.")
+                break
+            elseif errStr:find("enough") then
+                activeListings[target.UID] = true
+            end
+        end
+
+        if i < toListCount and Config.ListingDelay > 0 then
+            task.wait(Config.ListingDelay)
+        end
+    end
+end
+
+task.spawn(function()
+    print("[SellHugeCV] Auto Sell Huge CV Engine started successfully.")
+    while getgenv().SellHugeCV_Running do
+        if Config.Enabled then
+            RunListingCycle()
+        end
+
+        local waitElapsed = 0
+        local checkStep = 0.5
+        while waitElapsed < Config.CycleInterval do
+            if triggerImmediateCycle then
+
+                local elapsedSinceSale = os.clock() - lastSaleTime
+                if elapsedSinceSale < 2.5 then
+                    task.wait(2.5 - elapsedSinceSale)
+                end
+                triggerImmediateCycle = false
+                print("[SellHugeCV] Fast refill triggered by sale event.")
+                break
+            end
+            task.wait(checkStep)
+            waitElapsed = waitElapsed + checkStep
+        end
+    end
+end)
+
+local moduleApi = {
+    Config = Config,
+    RunCycle = RunListingCycle,
+    ScanPets = ScanEligibleHugePets,
+    GetMyActiveListings = GetMyActiveListings
+}
+getgenv().SellHugeCV_Module = moduleApi
+return moduleApi
